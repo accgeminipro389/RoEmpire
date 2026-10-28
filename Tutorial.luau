@@ -1,193 +1,652 @@
---!strict
--- A new player's first match (2026-10-04: an updated tutorial for new players, designed for phones
--- first, since 90% of the players are on a phone, with its steps drawn from the analytics funnels).
--- The onboarding funnel of the 28 days before it (202,158 new players):
+--!nonstrict
+-- A new player's first match, step by step (Data/Tutorial: the steps and why; 2026-10-04: a new
+-- tutorial for new players, made for phones first). One small goal at a time:
+--   * a card at the top of the screen: "2 / 6", one short line, a bar for a goal with progress, and
+--     Skip. Short enough to read at a glance on a phone; it never covers the map's middle or the
+--     command bar;
+--   * a tap mark where to tap (two rings closing on a dot, with "Tap here" under it): the map spot or
+--     the control the step is about. It hides while the player is busy and comes back after
+--     Data/Tutorial.NUDGE_S without an order;
+--   * a finished step turns the card green for a moment, with a sound, then the next one comes.
+-- The spawn step has no card (the spawn banner is up there): only the mark on a roomy spot, which
+-- is taken for the player after AUTO_SPAWN_S. The City step tops the player's gold up to a City's
+-- price. A step nobody finishes in STEP_MAX_S is passed over. While it runs the coach's tips are
+-- off (UIRoot); they take over afterwards. While it runs the Attack bar starts at its default and
+-- stops at Data.RATIO_CAP, and an order leaves Data.TROOP_FLOOR of the army's cap at home (UICtx
+-- .ratio_max / .troop_floor): a new player can't empty their nation.
 --
---   Joined 100% -> Title 99% -> Match Started 85% -> Spawned 81% -> First Attack 66%
---   -> Survived 3 Min 32% -> Survived 10 Min 24% -> Second Match 21%
---
---   * 14% never start a match: the first match starts by itself, on this device, at once;
---   * 5% never pick a start: a spot is pointed out, and taken for them after AUTO_SPAWN_S;
---   * 19% spawn and never attack: the first step is the first tap, with the place to tap marked;
---   * half of those who attack are gone within 3 minutes, while the AI may not even attack them
---     yet (Rules.HUMAN_GRACE_TICKS): they leave with nothing to do. So the first minutes are a list
---     of small goals with a reward at the end, on a match with fewer tribes in the way (TRIBES)
---     and the gentlest AI (DIFFICULTY).
---
--- The match is an ordinary solo match otherwise: it goes on after the last step. client/UI/Tutorial
--- runs the steps; server/Analytics logs them as the "Tutorial" funnel (FUNNEL); the Stars are paid
--- once per player (server/Purchases.tutorial_bonus).
-local Tutorial = {}
+--   Tutorial.new(ctx, ui)
+--   :begin()                 the tutorial match was asked for
+--   :stop(how)               "done" | "skipped" | "left"
+--   .active, .finished (Signal: how), .step_done (Signal: funnel step, name), .closed (Signal: the
+--   last card is gone)
+local UITheme = require("./UITheme")
+local W = require("./Widgets")
+local GlassPanel = require("./GlassPanel")
+local UICtx = require("./UICtx")
+local Signal = UITheme.core("Signal")
+local Defs = UICtx.core("Defs")
+local Data = UICtx.data("Tutorial")
 
---- Stars for finishing it (5% of the cheapest Arsenal unlock: the bar on its card moves).
-Tutorial.STARS = 1000
---- Tribes on the tutorial's map (a normal match has Rules.DEFAULT_TRIBES, 400): room to grow fast.
-Tutorial.TRIBES = 60
-Tutorial.DIFFICULTY = 0
---- Ticks (10 a second) from placing the capital to the match starting. A solo match waits 50, but
---- (2026-10-04) a 5 s wait after placing the capital confused new players, so the tutorial's round
---- starts much sooner.
-Tutorial.COUNTDOWN_TICKS = 10
---- The Attack bar while the tutorial runs: it starts at the default and stops at RATIO_CAP (the
---- player's saved setting could leave it at about 85%, which is too much; 2026-10-04).
-Tutorial.RATIO_CAP = 0.5
---- Keeps players from going too low in troop count (2026-10-04): while the tutorial
---- runs an order leaves at least TROOP_FLOOR of the army's cap at home (it is trimmed to what may go,
---- and refused when nothing may). The floor holds from the first time the army reaches FLOOR_ARM of
---- its cap (a new nation starts below it), or from FLOOR_ARM_S seconds into play, whichever comes
---- first (floor_armed).
----   * The seconds since 2026-10-27: a new nation starts at about a fifth of its cap, so a player who
----     sent every troop as it came never reached FLOOR_ARM, and the floor never held for the very
----     players it is for.
----   * Not before the FLOOR_FROM step (2026-10-27): on "grow" it refused taps the card asked for
----     ("Troops low. Let them grow back" under the card's "Keep tapping empty land to grow"), since
----     the cap climbs with every tile taken. Grow lost 11.6% of the players who reached it, the most
----     of any step, and 110,302 of its 175,898 left with Skip (the week to 2026-10-26). Before the
----     first neighbour there is nobody to fear, and the Attack bar's cap (RATIO_CAP) still holds.
-Tutorial.TROOP_FLOOR = 0.25
-Tutorial.FLOOR_ARM = 0.35
-Tutorial.FLOOR_ARM_S = 10
-Tutorial.FLOOR_FROM = "attack"
-Tutorial.FLOOR_REASON = "Troops low. Let them grow back"
---- A new player's first ROOKIE_MATCHES matches (the tutorial's among them) keep a floor under the
---- army after the tutorial too (2026-10-27): an order leaves ROOKIE_FLOOR of the army's cap at home,
---- from the time it arms (floor_armed; client/UI/UIAdvisor.check_floor). An army
---- spent below a fifth of its cap all but loses the match, and 23% of matches ended within their
---- first 3 minutes (Match funnel, the week to 2026-10-26). The first order held back in a match
---- says why (Coach "floor").
-Tutorial.ROOKIE_MATCHES = 5
-Tutorial.ROOKIE_FLOOR = 0.2
+local Tutorial = W.class(W.Control)
 
---- True while a player with `matches_before` matches before this one is still a new player.
-function Tutorial.rookie(matches_before: number): boolean
-	return matches_before < Tutorial.ROOKIE_MATCHES
+--- The card stays green this long after a step, and the last card this long.
+Tutorial.DONE_S = 0.9
+Tutorial.END_S = 9.0
+--- Spawn spots tried for the roomiest one.
+Tutorial.SPAWN_TRIES = 240
+--- Free land this far (tiles) from every nation is roomy enough.
+Tutorial.SPAWN_ROOM = 35.0
+--- The camera shows the suggested spot with tiles this many px across.
+Tutorial.SPAWN_PX = 5.0
+
+function Tutorial.new(c: any, ui: any)
+	local self = setmetatable({}, Tutorial.__mt)
+	W.Control._init(self)
+	self.ctx = c
+	self.ui = ui
+	self.active = false
+	self.finished = Signal.new()
+	self.step_done = Signal.new()
+	--- the last card (the reward) is gone: the screen is the coach's again
+	self.closed = Signal.new()
+	self._i = 0
+	self._t = 0.0
+	self._step_t = 0.0
+	self._flash = 0.0
+	self._ending = 0.0
+	self._sent = 0
+	self._idle = 0.0
+	self:set_mouse_filter(W.MOUSE_IGNORE)
+	self:set_anchors_and_offsets_preset(W.PRESET_FULL_RECT)
+	-- the tap mark
+	self._mark = UICtx.canvas(self.gui, "TutorialMark")
+	self._mark.ZIndex = 1
+	self._ring_a = UICtx.ring(self._mark, Vector2.zero, 10, 3, UITheme.AMBER, 1)
+	self._ring_b = UICtx.ring(self._mark, Vector2.zero, 10, 2, UITheme.AMBER, 1)
+	self._dot = UICtx.circle(self._mark, Vector2.zero, 6, UITheme.AMBER, 0)
+	self._tap = UICtx.make("TextLabel", {
+		BackgroundColor3 = Color3.fromRGB(14, 20, 38),
+		BackgroundTransparency = 0.15,
+		Text = "Tap here",
+		FontFace = Font.fromId(12187365977, Enum.FontWeight.Bold),
+		TextSize = 13,
+		TextColor3 = Color3.new(1, 1, 1),
+		AutomaticSize = Enum.AutomaticSize.XY,
+		AnchorPoint = Vector2.new(0.5, 0),
+	}, self._mark)
+	UICtx.make("UICorner", { CornerRadius = UDim.new(0.5, 0) }, self._tap)
+	UICtx.make("UIPadding", {
+		PaddingLeft = UDim.new(0, 9),
+		PaddingRight = UDim.new(0, 9),
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 4),
+	}, self._tap)
+	self._mark.Visible = false
+	-- the card
+	local card = GlassPanel.new(12.0, 8.0, UITheme.R_MD, true, 18)
+	card:set_accent(UITheme.AMBER)
+	card:set_border(UITheme.c(UITheme.AMBER, 0.5))
+	self._card = card
+	local h = UITheme.hbox(10)
+	card:add_child(h)
+	self._count = UITheme.label("1 / 6", 12, 800, UITheme.AMBER)
+	self._count.size_flags_vertical = W.SHRINK_CENTER
+	h:add_child(self._count)
+	local v = UITheme.vbox(5)
+	v.size_flags_horizontal = W.EXPAND_FILL
+	v.size_flags_vertical = W.SHRINK_CENTER
+	self._text = UITheme.label("", 14, 700, UITheme.TEXT)
+	self._text:set_autowrap(true)
+	self._text:set_min_size(Vector2.new(220, 0))
+	v:add_child(self._text)
+	-- (a goal with progress: a thin bar under the line)
+	local bar = UICtx.make("Frame", {
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 0.85,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 5),
+	})
+	UICtx.make("UICorner", { CornerRadius = UDim.new(0.5, 0) }, bar)
+	self._fill = UICtx.make("Frame", {
+		BackgroundColor3 = UITheme.AMBER,
+		BorderSizePixel = 0,
+		Size = UDim2.fromScale(0, 1),
+	}, bar)
+	UICtx.make("UICorner", { CornerRadius = UDim.new(0.5, 0) }, self._fill)
+	self._bar = W.wrap(bar)
+	self._bar:set_min_size(Vector2.new(0, 5))
+	self._bar:set_mouse_filter(W.MOUSE_IGNORE)
+	v:add_child(self._bar)
+	h:add_child(v)
+	self._skip = UITheme.button("Skip", "GhostButton", "", 36.0)
+	self._skip:set_font_size(12)
+	self._skip:set_min_size(Vector2.new(52, 36))
+	self._skip.size_flags_vertical = W.SHRINK_CENTER
+	self._skip.pressed:Connect(function()
+		if self._ending > 0.0 then
+			self:_close()
+		else
+			self:stop("skipped")
+		end
+	end)
+	h:add_child(self._skip)
+	self:add_child(card)
+	card:set_visible(false)
+	self:set_process(true)
+	return self
 end
 
---- True once the floor under a new player's army holds: the army has `troops` of its `cap`, at
---- FLOOR_ARM of it or more, or the match has been played `played_s` seconds, FLOOR_ARM_S or more.
-function Tutorial.floor_armed(troops: number, cap: number, played_s: number): boolean
-	return played_s >= Tutorial.FLOOR_ARM_S or (cap > 0 and troops >= Tutorial.FLOOR_ARM * cap)
+--- The tutorial match was asked for: the steps begin with its spawn phase.
+function Tutorial.begin(self)
+	self.active = true
+	self._i = 1
+	self._step_t = 0.0
+	self._flash = 0.0
+	self._ending = 0.0
+	self._idle = 0.0
+	self._spot = nil
+	self._spot_state = nil
+	self._picked = false
+	self._base = nil
+	self._neighbour = nil
+	self._gold_given = false
+	self._sent = #self.ctx.sent_log
+	self._card:set_visible(false)
+	self._started = false
+	-- the Attack bar: from its default, never past the cap; the floor under the army comes from the
+	-- FLOOR_FROM step, once it arms (Data.floor_armed; _process)
+	local ctx = self.ctx
+	ctx.ratio_max = 1.0
+	ctx:set_ratio(UICtx.DEFAULT_RATIO)
+	ctx:set_ratio_max(Data.RATIO_CAP)
+	ctx.troop_floor = nil
 end
---- Seconds on the spawn step before a start is picked for the player.
-Tutorial.AUTO_SPAWN_S = 12
---- "grow": let the troops refill, then one expansion. It teaches the rhythm, never "keep tapping"
---- (2026-10-27: the card said "Keep tapping empty land to grow", which is bad advice: an order sent on
---- an emptied army leaves the nation open, and a small army regrows slowly). An expansion counts when
---- it is sent with the army at GROW_READY of its cap or more; below that the card says to let the
---- troops refill, its bar fills towards ready (Tutorial.refill) and the mark is on the troop count.
----   * v111 (2026-10-27) asked for GROW_TAPS = 2 such expansions and 3x the land, with no bar while
----     the troops refilled: Skip on this step went up by about 60% a match (06:00-16:00 UTC against
----     the day before). Now one expansion, and the wait shows how far it has to go: about 7 s after
----     the "expand" step's order on open land (a headless Sim, 2026-10-27). An order sent before then
----     spends the refill, so the card says to wait for the bar for EARLY_S.
-Tutorial.GROW_TAPS = 1
-Tutorial.GROW_READY = 0.3
-Tutorial.EARLY_S = 2.5
---- "attack": passed over when nobody borders the player this long after the step began.
-Tutorial.CONTACT_WAIT_S = 25
---- The Attack bar's step asks for one stop of it, RATIO_GOAL (the next one up from where the bar
---- starts), left there for RATIO_HOLD_S: one tap on the stop the mark points at. Never more: since
---- 2026-10-04 the tutorial never encourages a 100% attack (an attack with everything leaves the
---- nation empty). Above RATIO_HIGH the card says to go back.
----   * Until 2026-10-08 it asked for 27% to 45% of a slider that ran from 1% to 100%, held for half
----     a second: on a phone that was 17 px of a 96 px track. 19.4% of the players who reached the
----     step left on it, the most of any step (Tutorial funnel, 2026-10-07), so the
----     step was made easier.
----   * Nobody waits on it past RATIO_MAX_S (the other steps: STEP_MAX_S).
-Tutorial.RATIO_GOAL = 0.35
-Tutorial.RATIO_LOW = 0.3
-Tutorial.RATIO_HIGH = 0.4
-Tutorial.RATIO_HOLD_S = 0.2
-Tutorial.RATIO_MAX_S = 30
-Tutorial.RATIO_TOO_MUCH = "Too many! Tap 35%"
---- A step nobody finishes in this long is passed over (the player is never stuck on one).
-Tutorial.STEP_MAX_S = 75
---- With no order for this long the pointer shows where to tap again.
-Tutorial.NUDGE_S = 5
 
---- The steps, in order. `touch` / `desktop`: what the card says; `%s` is the neighbour's name.
-Tutorial.STEPS = {
-	{ id = "spawn", touch = "Tap the map to start your nation", desktop = "Click the map to start your nation" },
-	{ id = "expand", touch = "Tap the land next to you to take it", desktop = "Click the land next to you to take it" },
-	{
-		id = "grow",
-		touch = "Tap empty land to expand",
-		desktop = "Click empty land to expand",
-		wait = "Now let your troops refill",
-		-- (an order sent while they refill: it spends them, and the bar drops)
-		early = "Wait for the bar to fill",
-		bar = true,
-	},
-	-- (the neighbour before the slider: a first attack at the slider's 20% leaves an army at home; in
-	-- the first order of steps a new player dragged it to 100% and sent everything)
-	{
-		id = "attack",
-		touch = "Tap %s, then tap again to attack",
-		desktop = "Click %s's land to attack them",
-	},
-	{
-		id = "ratio",
-		touch = "Tap 35% below. Keep troops home!",
-		desktop = "Click 35% on the Attack bar. Keep troops home!",
-		max_s = Tutorial.RATIO_MAX_S,
-	},
-	{
-		id = "city",
-		touch = "Open BUILD, pick City, tap your land",
-		desktop = "Pick City (1) and click your land",
-		note = "Here is gold for your first City",
-	},
-}
+function Tutorial.stop(self, how: string)
+	if not self.active then
+		return
+	end
+	self.active = false
+	self._mark.Visible = false
+	self.ctx:set_ratio_max(1.0)
+	self.ctx.troop_floor = nil
+	if how == "done" then
+		-- the last card: the reward, and where it goes
+		self._ending = Tutorial.END_S
+		self._count:set_text("★")
+		self._text:set_text(
+			string.format("Tutorial complete! +%s Stars\nSpend them in the ARSENAL", UICtx.commas(Data.STARS))
+		)
+		self._bar:set_visible(false)
+		self._skip:set_text("OK")
+		self:_tint(UITheme.GREEN)
+		self._card:set_visible(true)
+		self:_place()
+		self.ctx:sfx("unlock", -4.0)
+	else
+		self._card:set_visible(false)
+	end
+	self.finished:Fire(how)
+	if how ~= "done" then
+		self.closed:Fire()
+	end
+end
 
---- The "Tutorial" funnel's steps (Creator Dashboard): 1 is the match starting, then one a step,
---- then finishing. A step passed over is not logged.
-Tutorial.FUNNEL = { "Started", "Spawned", "First Tap", "Grew", "Attacked", "Used Slider", "Built City", "Completed" }
+function Tutorial._close(self)
+	self._ending = 0.0
+	self._card:set_visible(false)
+	self.closed:Fire()
+end
 
---- The funnel step of finishing step `id` (2..7), or nil.
-function Tutorial.funnel_step(id: string): number?
-	for i, s in Tutorial.STEPS do
-		if s.id == id then
-			return i + 1
+function Tutorial._tint(self, col: any)
+	self._card:set_accent(col)
+	self._card:set_border(UITheme.c(col, 0.5))
+	UITheme.set_font_color(self._count, col)
+end
+
+function Tutorial.apply_layout(self)
+	if self._card.visible then
+		self:_place()
+	end
+end
+
+--- The card: top centre, under Roblox's top bar row and the match's status pill.
+function Tutorial._place(self)
+	local ctx = self.ctx
+	local vp, ins = ctx.vp, ctx.insets
+	local c = ctx.compact
+	self._text:set_font_size(if c then 13 else 15)
+	-- (the reward's two lines are a little longer than a step's)
+	self._text:set_min_size(Vector2.new(if self._ending > 0.0 then 256 elseif c then 200 else 260, 0))
+	self._card:reset_size()
+	local sz = self._card:get_combined_minimum_size()
+	local x = math.clamp((vp.X - sz.X) * 0.5, ins.x + 8.0, math.max(ins.x + 8.0, vp.X - ins.z - sz.X - 8.0))
+	UICtx.move_node(self._card, Vector2.new(math.floor(x), math.floor(ins.y + (if c then 62.0 else 74.0))))
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- What the player did
+-- ---------------------------------------------------------------------------------------------
+
+--- The orders sent since the last look: any, an attack on a neighbour, on empty land.
+function Tutorial._orders(self): (boolean, boolean, boolean)
+	local log = self.ctx.sent_log
+	local s = self.ctx.state
+	local any, on_owner, on_land = false, false, false
+	-- (the log is a window of the last orders: after it wraps, count from its end)
+	if self._sent > #log then
+		self._sent = 0
+	end
+	for i = self._sent + 1, #log do
+		local it = log[i].intent
+		if type(it) == "table" and (it.type == "attack" or it.type == "boat") then
+			any = true
+			local target = tonumber(it.target)
+			if target == nil and type(it.tile) == "number" and s ~= nil then
+				target = s:tile_owner(it.tile)
+			end
+			if target ~= nil and target > 0 then
+				on_owner = true
+			else
+				on_land = true
+			end
+		end
+	end
+	self._sent = #log
+	return any, on_owner, on_land
+end
+
+--- A roomy place to start: of SPAWN_TRIES free land tiles, one far from every nation's start
+--- (SPAWN_ROOM tiles is far enough) and away from the map's top and bottom edges (the first pick on
+--- the world map was the middle of Antarctica: empty, and nothing to see).
+function Tutorial._find_spot(self): number?
+	local s = self.ctx.state
+	local map = s and s.map
+	if map == nil or type(map.land_tile) ~= "function" or (map.land_count or 0) <= 0 then
+		return nil
+	end
+	local starts = {}
+	for _, o in s.owners do
+		if type(o.spawn_tile) == "number" and o.spawn_tile >= 0 then
+			table.insert(starts, o.spawn_tile)
+		end
+	end
+	local best, best_d = nil, -1.0
+	for _ = 1, Tutorial.SPAWN_TRIES do
+		local t = map:land_tile(math.random(0, map.land_count - 1))
+		if map:is_contestable(t) and s:tile_owner(t) == 0 and not map:is_coastal(t) then
+			local d = math.huge
+			for _, o in starts do
+				d = math.min(d, Defs.tile_distance(t, o))
+			end
+			d = math.min(d, Tutorial.SPAWN_ROOM)
+			local W, H = map.W or Defs.W, map.H or Defs.H
+			local off = math.abs((t // W) / H - 0.45)
+			d -= math.max(0.0, off - 0.27) * 300.0
+			if d > best_d then
+				best, best_d = t, d
+			end
+		end
+	end
+	return best
+end
+
+function Tutorial._say(self, i: number, arg: string?)
+	local step = Data.STEPS[i]
+	local txt = if self.ctx.touch then step.touch else step.desktop
+	if string.find(txt, "%s", 1, true) then
+		txt = string.format(txt, arg or "them")
+	end
+	self._count:set_text(string.format("%d / %d", i, #Data.STEPS))
+	self._text:set_text(txt)
+	self._bar:set_visible(step.bar == true)
+	self._fill.Size = UDim2.fromScale(0, 1)
+	self._fill.BackgroundColor3 = UITheme.AMBER
+	self._fill_f = 0.0
+	self._skip:set_text("Skip")
+	self:_tint(UITheme.AMBER)
+	self._card:set_visible(i > 1)
+	if i > 1 then
+		self:_place()
+		UICtx.pop_in(self._card, 0.0, 0.94, 0.3, true)
+	end
+end
+
+--- Step `i` is finished (`passed`: nobody did it in time, it is passed over without a tick).
+function Tutorial._advance(self, passed: boolean?)
+	local step = Data.STEPS[self._i]
+	if not passed then
+		self.step_done:Fire(Data.funnel_step(step.id), Data.FUNNEL[Data.funnel_step(step.id)])
+		self.ctx:sfx("confirm", -4.0)
+		if self._card.visible then
+			self:_tint(UITheme.GREEN)
+			self._text:set_text("Nice!")
+			self._bar:set_visible(false)
+			self._flash = Tutorial.DONE_S
+		end
+	end
+	self._i += 1
+	self._step_t = 0.0
+	self._idle = 0.0
+	self._shown = nil
+	if self._i > #Data.STEPS then
+		self.step_done:Fire(#Data.FUNNEL, Data.FUNNEL[#Data.FUNNEL])
+		self:stop("done")
+	end
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Per frame
+-- ---------------------------------------------------------------------------------------------
+
+function Tutorial._process(self, delta: number)
+	self._t += delta
+	if self._ending > 0.0 then
+		self._ending -= delta
+		if self._ending <= 0.0 then
+			self:_close()
+		end
+		return
+	end
+	if not self.active then
+		return
+	end
+	local ctx = self.ctx
+	local ui = self.ui
+	local s = ctx.state
+	if s == nil or ctx:mode() ~= UICtx.MODE_SOLO then
+		return
+	end
+	if s.phase == Defs.PHASE_OVER then
+		self:stop("left")
+		return
+	end
+	-- a finished step's green card stands a moment before the next line
+	if self._flash > 0.0 then
+		self._flash -= delta
+		self._mark.Visible = false
+		if self._flash > 0.0 then
+			return
+		end
+	end
+	local i = self._i
+	local step = Data.STEPS[i]
+	local o = ctx:my()
+	local any, on_owner, on_land = self:_orders()
+	self._step_t += delta
+	if
+		ctx.troop_floor == nil
+		and i >= (Data.step_index(Data.FLOOR_FROM) or 1)
+		and o ~= nil
+		and Data.floor_armed(o.troops or 0, o.max_troops or 0, ctx:alive_seconds())
+	then
+		ctx.troop_floor = Data.TROOP_FLOOR
+	end
+	if not self._started and self._step_t > 1.0 then
+		-- the match is up (and reported: the server logs a step for a match it knows of)
+		self._started = true
+		self.step_done:Fire(1, Data.FUNNEL[1])
+	end
+	self._idle = if any then 0.0 else self._idle + delta
+	local point = Vector2.new(-1, -1)
+	--- (a control's radius, when the mark is for one: it goes around it)
+	local around: number? = nil
+	--- (what the mark says, when not the step's own word)
+	local word: string? = nil
+	local id = step.id
+	if id == "spawn" then
+		if o ~= nil and o.spawned then
+			self:_advance()
+			return
+		end
+		if self._spot == nil or self._spot_state ~= s then
+			self._spot = self:_find_spot()
+			self._spot_state = s
+			self._step_t = 0.0
+			if self._spot ~= nil then
+				-- the camera goes there, close enough that a thumb hits the land around it
+				local w = ctx.world
+				local d = if w ~= nil and w.rig ~= nil and type(w.rig.scale_to_distance) == "function"
+					then w.rig:scale_to_distance(Tutorial.SPAWN_PX)
+					else -1.0
+				ctx:world_call("focus_tile", { self._spot, d, 0.9 })
+			end
+		end
+		if self._spot ~= nil then
+			point = ctx:tile_screen_pos(self._spot)
+			if self._step_t > Data.AUTO_SPAWN_S and not self._picked and s:tile_owner(self._spot) == 0 then
+				-- nobody picked: this spot is theirs
+				self._picked = true
+				ctx:send({ type = "spawn", tile = self._spot })
+			end
+		end
+	elseif o ~= nil and o.spawned and o.alive == false then
+		self:stop("left") -- (conquered: the result screen takes over)
+		return
+	elseif o == nil or not ctx:alive_player() or s.phase ~= Defs.PHASE_PLAYING then
+		self._mark.Visible = false
+		return
+	else
+		if self._shown ~= i then
+			-- the step's line (and what it needs) once, when it comes up
+			self._shown = i
+			if id == "grow" then
+				self._taps = 0
+				self._ready = nil
+				self._refill = nil
+				self._early = 0.0
+				self._line = nil
+			elseif id == "attack" then
+				self._neighbour = nil
+			elseif id == "ratio" then
+				self._ratio_ok = 0.0
+				self._ratio_high = false
+			elseif id == "city" and not self._gold_given then
+				self._gold_given = true
+				local sim = ctx:session_call("local_sim")
+				local cost = ctx.rules:cost("city")
+				if sim ~= nil and type(sim.o_gold) == "table" and cost > 0 and (sim.o_gold[ctx:me()] or 0) < cost then
+					sim.o_gold[ctx:me()] = cost
+				end
+			end
+			self:_say(i, if self._neighbour ~= nil then s:owner_name(self._neighbour) else nil)
+		end
+		if id == "expand" then
+			if any then
+				self:_advance()
+				return
+			end
+			point = ui.advisor:frontier_point()
+		elseif id == "grow" then
+			-- let the troops refill, then expand: an order counts when the army was ready
+			-- (Data.GROW_READY) as it went; the bar fills towards ready
+			if any then
+				if self._ready then
+					self._taps += 1
+				else
+					-- (an order sent meanwhile spends the refill: the bar drops, and the card says why)
+					self._refill = nil
+					self._early = Data.EARLY_S
+				end
+			end
+			self._early = math.max((self._early or 0.0) - delta, 0.0)
+			if self._taps >= Data.GROW_TAPS then
+				self:_advance()
+				return
+			end
+			local cap = o.max_troops or 0
+			local f = if cap > 0 then Data.refill(o.troops, cap, self._refill) else 1.0
+			self._refill = f
+			-- (a full bar stays full, so ready stays ready while the cap climbs under it)
+			local ready = f >= 1.0
+			if ready ~= self._ready then
+				if ready and self._ready == false then
+					-- refilled: the card says so, so eyes on the troop count come back up
+					ctx:sfx("tick", -6.0)
+					UICtx.pop_in(self._card, 0.0, 0.97, 0.25, true)
+				end
+				self._ready = ready
+				self._fill.BackgroundColor3 = if ready then UITheme.GREEN else UITheme.AMBER
+			end
+			local line = if ready
+				then (if ctx.touch then step.touch else step.desktop)
+				elseif self._early > 0.0 then step.early
+				else step.wait
+			if line ~= self._line then
+				self._line = line
+				self._text:set_text(line)
+			end
+			if math.abs(f - (self._fill_f or 0.0)) >= 0.005 or (ready and self._fill_f ~= 1.0) then
+				self._fill_f = f
+				self._fill.Size = UDim2.fromScale(f, 1)
+			end
+			if not ready then
+				-- the troop count, filling
+				local tc = self:_troops_control()
+				if tc ~= nil then
+					local r = tc:get_global_rect()
+					point = UICtx.rect_center(r)
+					around = math.max(r.Width, r.Height) * 0.5
+					word = "Refilling"
+				end
+			elseif self._taps == 0 or self._idle > Data.NUDGE_S then
+				point = ui.advisor:frontier_point()
+			end
+		elseif id == "ratio" then
+			-- a moderate share, and left there: never a push to send everything
+			local r = ctx.ratio
+			if r >= Data.RATIO_LOW and r <= Data.RATIO_HIGH then
+				self._ratio_ok = (self._ratio_ok or 0.0) + delta
+				if self._ratio_ok >= Data.RATIO_HOLD_S then
+					self:_advance()
+					return
+				end
+			else
+				self._ratio_ok = 0.0
+			end
+			local high = r > Data.RATIO_HIGH
+			if high ~= self._ratio_high then
+				self._ratio_high = high
+				self._text:set_text(
+					if high then Data.RATIO_TOO_MUCH elseif ctx.touch then step.touch else step.desktop
+				)
+				self:_tint(if high then UITheme.RED else UITheme.AMBER)
+			end
+			-- the mark goes around the stop to tap
+			local sl = ui.bar._slider
+			if sl ~= nil and sl:is_visible_in_tree() then
+				local r = sl:stop_rect(Data.RATIO_GOAL) or sl:get_global_rect()
+				point = UICtx.rect_center(r)
+				around = math.min(r.Width, r.Height) * 0.5
+			end
+		elseif id == "attack" then
+			if on_owner then
+				self:_advance()
+				return
+			end
+			if self._neighbour == nil or s:get_owner(self._neighbour) == nil then
+				local ns = ctx.borders:neighbour_ids()
+				if #ns > 0 then
+					self._neighbour = ns[1]
+					self:_say(i, s:owner_name(ns[1]))
+				elseif self._step_t > Data.CONTACT_WAIT_S then
+					self:_advance(true) -- nobody to attack yet
+					return
+				else
+					-- no neighbour yet: keep growing towards one
+					self._text:set_text(if ctx.touch then "Keep growing until you meet a neighbour" else "Keep growing until you meet a neighbour")
+					if self._idle > Data.NUDGE_S then
+						point = ui.advisor:frontier_point()
+					end
+				end
+			end
+			if self._neighbour ~= nil and s:get_owner(self._neighbour) ~= nil then
+				point = ctx:tile_screen_pos(s:label_tile(self._neighbour))
+			end
+		elseif id == "city" then
+			for _, st in s.structures do
+				if st.owner == ctx:me() and st.kind == Defs.S_CITY then
+					self:_advance()
+					return
+				end
+			end
+			local cb = ui.bar:button("city")
+			local b = if cb ~= nil and cb:is_visible_in_tree() then cb else ui.bar._tray_btn
+			local pc = ui.place_confirm
+			local placing = ui.interact.aim_kind == "city"
+			-- (while the City is in hand the game's own line stands where the card does: the card
+			-- steps aside and only the mark leads on)
+			if self._card.visible == placing then
+				self._card:set_visible(not placing)
+			end
+			if pc ~= nil and pc.is_open and pc._ok:is_visible_in_tree() then
+				-- a spot is picked: the tick builds it
+				local r = pc._ok:get_global_rect()
+				point = UICtx.rect_center(r)
+				around = math.max(r.Width, r.Height) * 0.5
+			elseif placing then
+				-- the City is in hand: the mark moves to the player's land
+				point = ctx:tile_screen_pos(s:label_tile(ctx:me()))
+			elseif b ~= nil and b:is_visible_in_tree() then
+				local r = b:get_global_rect()
+				point = UICtx.rect_center(r)
+				around = math.max(r.Width, r.Height) * 0.5
+			end
+		end
+		if self._step_t > (step.max_s or Data.STEP_MAX_S) then
+			self:_advance(true)
+			return
+		end
+	end
+	self:_draw_mark(point, word or step.mark, around)
+end
+
+--- The command bar's troop count as it shows (phones' compact bar has its own), or nil.
+function Tutorial._troops_control(self): any
+	local bar = self.ui.bar
+	if bar == nil then
+		return nil
+	end
+	for _, c in { bar._troops_box, bar._m_troops } do
+		if c ~= nil and c:is_visible_in_tree() then
+			return c
 		end
 	end
 	return nil
 end
 
---- True for a player who has never played: no tutorial state, no match counted, no tip seen.
---- `ui` is the saved [ui] settings, `stats` the saved [stats] ({ matches }).
-function Tutorial.is_new(ui: any, stats: any): boolean
-	local u = if type(ui) == "table" then ui else {}
-	local s = if type(stats) == "table" then stats else {}
-	if type(u.tutorial) == "string" and u.tutorial ~= "" then
-		return false
+--- The tap mark at logical point `p` ((-1, -1): none); `word`: what it says instead of "Tap here".
+--- `around`: the mark is for a control of this radius, and goes around it, not on it (on the
+--- confirm tick the dot and rings sat on the icon, which looked bad; 2026-10-04).
+--- Without it (a spot on the map) two rings close on a dot.
+function Tutorial._draw_mark(self, p: Vector2, word: string?, around: number?)
+	local ctx = self.ctx
+	local mark = self._mark
+	if p.X < 0.0 or p.Y < 0.0 or p.X > ctx.vp.X or p.Y > ctx.vp.Y then
+		mark.Visible = false
+		return
 	end
-	if (tonumber(s.matches) or 0) > 0 then
-		return false
-	end
-	if type(u.tips_seen) == "table" and next(u.tips_seen) ~= nil then
-		return false
-	end
-	return true
-end
-
---- "grow"'s bar while the army refills: how far `troops` are towards GROW_READY of `cap` (0..1), and
---- never below `shown` (what the bar already shows): the cap climbs as the expansion's land comes in,
---- and a bar that slides back while nobody did anything reads as broken. (An order sent meanwhile
---- does empty it: the client passes no `shown` then.)
-function Tutorial.refill(troops: number, cap: number, shown: number?): number
-	local need = Tutorial.GROW_READY * cap
-	local f = if need > 0 then math.clamp(troops / need, 0, 1) else 1
-	return math.max(f, shown or 0)
-end
-
---- Where step `id` is in STEPS, or nil.
-function Tutorial.step_index(id: string): number?
-	for i, s in Tutorial.STEPS do
-		if s.id == id then
-			return i
-		end
-	end
-	return nil
+	ctx:fit_canvas(mark)
+	mark.Visible = true
+	-- two rings closing on the dot, half a beat apart: a finger coming down
+	local k1 = (self._t % 1.1) / 1.1
+	local k2 = ((self._t + 0.55) % 1.1) / 1.1
+	-- (a control: the rings close from outside onto its edge and stop there, and there is no dot)
+	local inner = if around ~= nil then around + 4.0 else 12.0
+	local outer = inner + (if around ~= nil then 16.0 else 22.0)
+	UICtx.set_circle(self._ring_a, p, outer - (outer - inner) * k1)
+	UICtx.set_circle(self._ring_b, p, outer - (outer - inner) * k2);
+	(self._ring_a:FindFirstChild("Stroke") :: UIStroke).Transparency = 1 - k1 * 0.95;
+	(self._ring_b:FindFirstChild("Stroke") :: UIStroke).Transparency = 1 - k2 * 0.95
+	self._dot.Visible = around == nil
+	UICtx.set_circle(self._dot, p, 6.0)
+	self._tap.Text = word or (if ctx.touch then "Tap here" else "Click here")
+	-- (under the mark; over it when the mark is near the bottom of the screen, on the command bar)
+	local gap = outer + 6.0
+	local below = p.Y + gap + 26 < ctx.vp.Y - ctx.insets.w
+	self._tap.AnchorPoint = Vector2.new(0.5, if below then 0 else 1)
+	self._tap.Position = UDim2.fromOffset(p.X, if below then p.Y + gap else p.Y - gap)
 end
 
 return Tutorial
