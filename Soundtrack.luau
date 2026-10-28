@@ -1,0 +1,33 @@
+-- Music: APM Music, licensed for Roblox experiences through the Creator Store.
+return {
+	credit = "Music: APM Music",
+	license = "Roblox Creator Store",
+	tracks = {
+		star_chasing = { id = "rbxassetid://9043657042", length = 140.51, title = "Star Chasing", pack = "APM Music" },
+		pomp_and_circumstance = { id = "rbxassetid://9045919213", length = 114.42, title = "Pomp and Circumstance", pack = "APM Music" },
+		history_in_the_making = { id = "rbxassetid://78013239746179", length = 32.79, title = "History In The Making", pack = "APM Music" },
+		suspicion_and_rain = { id = "rbxassetid://1838812583", length = 137.06, title = "Suspicion And Rain", pack = "APM Music" },
+		progression = { id = "rbxassetid://1845404643", length = 135.99, title = "Progression", pack = "APM Music" },
+		into_dust = { id = "rbxassetid://1837020589", length = 136.56, title = "Into Dust", pack = "APM Music" },
+		into_the_atmosphere = { id = "rbxassetid://9048112554", length = 95.24, title = "Into The Atmosphere", pack = "APM Music" },
+		voyage_of_discovery = { id = "rbxassetid://1845406309", length = 30.71, title = "Voyage Of Discovery", pack = "APM Music" },
+		suspicion = { id = "rbxassetid://1838812514", length = 93.91, title = "Suspicion", pack = "APM Music" },
+		on_the_warpath = { id = "rbxassetid://1837240654", length = 114.81, title = "On the Warpath", pack = "APM Music" },
+		deadly_assault = { id = "rbxassetid://1846877907", length = 62.25, title = "Deadly Assault", pack = "APM Music" },
+		fight_for_a_tomorrow = { id = "rbxassetid://1848108091", length = 61.61, title = "Fight For A Tomorrow", pack = "APM Music" },
+		imminent_closure = { id = "rbxassetid://9046506025", length = 110.5, title = "Imminent Closure", pack = "APM Music" },
+		fierce_attack = { id = "rbxassetid://1848179665", length = 44.46, title = "Fierce Attack", pack = "APM Music" },
+		no_time_to_waste = { id = "rbxassetid://1835279022", length = 124.23, title = "No Time To Waste", pack = "APM Music" },
+		underground_escape = { id = "rbxassetid://1837127294", length = 103.87, title = "Underground Escape", pack = "APM Music" },
+		victorious = { id = "rbxassetid://1839431872", length = 35.67, title = "Victorious", pack = "APM Music" },
+		fear_and_stealth = { id = "rbxassetid://1845450280", length = 30.27, title = "Fear And Stealth", pack = "APM Music" },
+	},
+	moods = {
+		title = { "star_chasing", "pomp_and_circumstance", "history_in_the_making" },
+		wait = { "suspicion_and_rain", "progression" },
+		calm = { "into_dust", "into_the_atmosphere", "voyage_of_discovery", "suspicion", "progression", "suspicion_and_rain" },
+		war = { "on_the_warpath", "deadly_assault", "fight_for_a_tomorrow", "imminent_closure", "fierce_attack", "no_time_to_waste", "underground_escape" },
+		victory = { "victorious" },
+		defeat = { "fear_and_stealth" },
+	},
+}
